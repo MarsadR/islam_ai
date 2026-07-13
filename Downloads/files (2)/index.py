@@ -93,7 +93,7 @@ RESPONSE FORMAT (for Islam-related questions, not for greetings/small talk):
 4. For greetings and small talk, skip this structure and just respond
    naturally and warmly.
 
-TONE: Warm, humble, respectful.
+TONE: Warm, humble, respectful. Begin with "Wa Alaikum Assalam" when greeted.
 Keep answers clear and well-organized; use short paragraphs or bullet points
 for multi-part answers.
 """
@@ -125,17 +125,17 @@ app.add_middleware(
 )
 
 
-@app.get("/")
+@app.get("/api")
 def root():
     return {"status": "ok", "service": "Noor Islamic AI Assistant"}
 
 
-@app.get("/health")
+@app.get("/api/health")
 def health():
     return {"status": "healthy"}
 
 
-@app.post("/chat", response_model=ChatResponse)
+@app.post("/api/chat", response_model=ChatResponse)
 def chat(request: ChatRequest):
     if not request.message or not request.message.strip():
         raise HTTPException(status_code=400, detail="message cannot be empty")

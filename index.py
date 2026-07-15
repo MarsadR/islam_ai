@@ -149,7 +149,7 @@ def chat(request: ChatRequest):
             model=MODEL,
             messages=messages,
             temperature=0.2,
-            max_tokens=1024,
+            max_tokens=2500,
         )
         reply = response.choices[0].message.content
         return ChatResponse(reply=reply)

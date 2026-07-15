@@ -15,6 +15,8 @@ Endpoint (once deployed on HF Spaces, Docker SDK):
 """
 
 import os
+import time
+from datetime import datetime, timezone, timedelta
 from typing import List, Literal, Optional
 
 from dotenv import load_dotenv
@@ -22,6 +24,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from groq import Groq
 from pydantic import BaseModel
+from supabase import create_client, Client
 
 load_dotenv()  # loads .env locally; no-op on HF Spaces (uses Space Secrets instead)
 
@@ -99,6 +102,21 @@ for multi-part answers.
 """
 
 
+# Supabase integration for persistent token tracking
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+supabase: Optional[Client] = None
+if SUPABASE_URL and SUPABASE_KEY:
+    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+else:
+    print("WARNING: SUPABASE_URL and SUPABASE_KEY not found. Token limiting will fallback to in-memory (resets on Vercel cold starts).")
+
+# In-memory dictionary as fallback
+user_token_usage = {}
+TOKEN_LIMIT = 4500
+RESET_TIME_SECONDS = 5 * 3600  # 5 hours
+
+
 class HistoryMessage(BaseModel):
     role: Literal["user", "assistant"]
     content: str
@@ -107,10 +125,13 @@ class HistoryMessage(BaseModel):
 class ChatRequest(BaseModel):
     message: str
     history: Optional[List[HistoryMessage]] = []
+    user_id: Optional[str] = None  # To identify the user for token limiting
 
 
 class ChatResponse(BaseModel):
     reply: str
+    tokens_used: Optional[int] = None
+    tokens_remaining: Optional[int] = None
 
 
 app = FastAPI(title="Noor Islamic AI Assistant API")
@@ -140,6 +161,62 @@ def chat(request: ChatRequest):
     if not request.message or not request.message.strip():
         raise HTTPException(status_code=400, detail="message cannot be empty")
 
+    user_id = request.user_id or "anonymous"
+    current_tokens = 0
+
+    if supabase is not None and user_id != "anonymous":
+        try:
+            # Check Supabase for user's token usage
+            db_response = supabase.table("user_token_usage").select("*").eq("user_id", user_id).execute()
+            if len(db_response.data) > 0:
+                record = db_response.data[0]
+                reset_time_str = record.get("reset_time")
+                current_tokens = record.get("tokens_used", 0)
+                
+                # Check if 5 hours have passed
+                reset_time = datetime.fromisoformat(reset_time_str.replace("Z", "+00:00"))
+                if datetime.now(timezone.utc) > reset_time:
+                    # Time has passed, reset tokens
+                    current_tokens = 0
+                    new_reset_time = datetime.now(timezone.utc) + timedelta(hours=5)
+                    supabase.table("user_token_usage").update({
+                        "tokens_used": 0,
+                        "reset_time": new_reset_time.isoformat()
+                    }).eq("user_id", user_id).execute()
+            else:
+                # Create record for new user
+                new_reset_time = datetime.now(timezone.utc) + timedelta(hours=5)
+                supabase.table("user_token_usage").insert({
+                    "user_id": user_id,
+                    "tokens_used": 0,
+                    "reset_time": new_reset_time.isoformat()
+                }).execute()
+        except Exception as e:
+            print(f"Supabase error checking tokens: {e}")
+            # Fallback to allow request if DB fails to avoid blocking users
+            pass
+            
+        if current_tokens >= TOKEN_LIMIT:
+            raise HTTPException(
+                status_code=429, 
+                detail=f"Token limit exceeded. You can only use {TOKEN_LIMIT} tokens per 5 hours. Please try again later."
+            )
+    else:
+        # Fallback in-memory logic
+        current_time = time.time()
+        if user_id not in user_token_usage:
+            user_token_usage[user_id] = {"tokens": 0, "reset_time": current_time + RESET_TIME_SECONDS}
+        else:
+            if current_time > user_token_usage[user_id]["reset_time"]:
+                user_token_usage[user_id] = {"tokens": 0, "reset_time": current_time + RESET_TIME_SECONDS}
+
+        if user_token_usage[user_id]["tokens"] >= TOKEN_LIMIT:
+            raise HTTPException(
+                status_code=429, 
+                detail=f"Token limit exceeded. You can only use {TOKEN_LIMIT} tokens per 5 hours. Please try again later."
+            )
+        current_tokens = user_token_usage[user_id]["tokens"]
+
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     messages.extend([m.model_dump() for m in request.history])
     messages.append({"role": "user", "content": request.message})
@@ -152,6 +229,25 @@ def chat(request: ChatRequest):
             max_tokens=2500,
         )
         reply = response.choices[0].message.content
-        return ChatResponse(reply=reply)
+        
+        # Calculate tokens used (Groq provides usage stats similar to OpenAI)
+        tokens_used = response.usage.total_tokens if response.usage else 0
+        
+        # Update user's token usage
+        if supabase is not None and user_id != "anonymous":
+            try:
+                supabase.table("user_token_usage").update({
+                    "tokens_used": current_tokens + tokens_used
+                }).eq("user_id", user_id).execute()
+            except Exception as e:
+                print(f"Supabase error updating tokens: {e}")
+        else:
+            user_token_usage[user_id]["tokens"] += tokens_used
+
+        return ChatResponse(
+            reply=reply,
+            tokens_used=tokens_used,
+            tokens_remaining=max(0, TOKEN_LIMIT - (current_tokens + tokens_used))
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Groq API error: {e}")
